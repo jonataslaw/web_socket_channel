@@ -3,7 +3,10 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:async/async.dart';
 import 'package:stream_channel/stream_channel.dart';
@@ -55,14 +58,14 @@ class IOWebSocketChannel extends StreamChannelMixin
   /// [WebSocketChannelException] wrapping that error and then closes.
   factory IOWebSocketChannel.connect(
     Object url, {
-    Iterable<String>? protocols,
+    Iterable<String>? protocols = const <String>['graphql-ws'],
     Map<String, dynamic>? headers,
     Duration? pingInterval,
   }) {
     late IOWebSocketChannel channel;
     final sinkCompleter = WebSocketSinkCompleter();
     final stream = StreamCompleter.fromFuture(
-      WebSocket.connect(url.toString(), headers: headers, protocols: protocols)
+      createWebsocket(url.toString(), headers: headers, protocols: protocols!)
           .then((webSocket) {
         webSocket.pingInterval = pingInterval;
         channel._webSocket = webSocket;
@@ -106,4 +109,58 @@ class _IOWebSocketSink extends DelegatingStreamSink implements WebSocketSink {
   @override
   Future close([int? closeCode, String? closeReason]) =>
       _webSocket.close(closeCode, closeReason);
+}
+
+Future<WebSocket> createWebsocket(String url,
+    {required Iterable<String> protocols,
+    Map<String, dynamic>? headers}) async {
+  final _httpClient = HttpClient();
+  var uri = Uri.parse(url);
+
+  final random = Random();
+  // Generate 16 random bytes.
+  final nonceData = Uint8List(16);
+  for (var i = 0; i < 16; i++) {
+    nonceData[i] = random.nextInt(256);
+  }
+  final nonce = base64.encode(nonceData);
+  uri = Uri(
+      scheme: uri.scheme == 'wss' ? 'https' : 'http',
+      userInfo: uri.userInfo,
+      host: uri.host,
+      port: uri.port,
+      path: uri.path,
+      query: uri.query,
+      fragment: uri.fragment);
+  final request = await _httpClient.openUrl('GET', uri);
+  if (uri.userInfo.isNotEmpty) {
+    print(uri.userInfo);
+    // If the URL contains user information use that for basic
+    // authorization.
+    final auth = base64.encode(utf8.encode(uri.userInfo));
+    request.headers.set(HttpHeaders.authorizationHeader, 'Basic $auth');
+  }
+  // Setup the initial handshake.
+  request.headers
+    ..set(HttpHeaders.connectionHeader, 'Upgrade')
+    ..set(HttpHeaders.upgradeHeader, 'websocket')
+    ..set('Sec-WebSocket-Key', nonce)
+    ..set('Cache-Control', 'no-cache')
+    ..set('Sec-WebSocket-Version', '13')
+    ..set('Sec-WebSocket-Protocol', protocols.first);
+  request.headers.removeAll('content-length');
+  if (headers != null) {
+    headers.forEach((key, value) {
+      print('setting header ${HttpHeaders.authorizationHeader} $value');
+      request.headers.set(HttpHeaders.authorizationHeader, value as Object);
+    });
+  }
+
+  print(request.headers);
+  final response = await request.close();
+
+  final socket = await response.detachSocket();
+  final websocket = WebSocket.fromUpgradedSocket(socket,
+      protocol: protocols.first, serverSide: false);
+  return websocket;
 }
